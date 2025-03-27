@@ -70,7 +70,7 @@ import (
 	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
 	"github.com/projectsveltos/addon-controller/controllers/chartmanager"
 	"github.com/projectsveltos/addon-controller/controllers/clustercache"
-	"github.com/projectsveltos/addon-controller/pkg/scope"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
 	"github.com/projectsveltos/libsveltos/lib/clusterproxy"
 	"github.com/projectsveltos/libsveltos/lib/deployer"
@@ -128,24 +128,17 @@ func deployHelmCharts(ctx context.Context, c client.Client,
 		return err
 	}
 
-	startInMgmtCluster := startDriftDetectionInMgmtCluster(o)
-	if clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeContinuousWithDriftDetection {
-		// Deploy drift detection manager first. Have manager up by the time resourcesummary is created
-		err = deployDriftDetectionManagerInCluster(ctx, c, clusterNamespace, clusterName, applicant,
-			clusterType, startInMgmtCluster, logger)
-		if err != nil {
-			return err
-		}
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName, clusterType, logger)
+	if err != nil {
+		return err
+	}
 
-		// Since we are updating resources to watch for drift, remove helm section in ResourceSummary to eliminate
-		// un-needed reconciliation (Sveltos is updating those resources so we don't want drift-detection to think
-		// a configuration drift is happening)
-		err = deployResourceSummaryInCluster(ctx, c, clusterNamespace, clusterName, clusterSummary.Name, clusterType, nil, nil,
-			[]libsveltosv1beta1.HelmResources{}, clusterSummary.Spec.ClusterProfileSpec.DriftExclusions, logger)
-		if err != nil {
-			logger.V(logs.LogInfo).Error(err, "failed to remove ResourceSummary.")
-			return err
-		}
+	startInMgmtCluster := startDriftDetectionInMgmtCluster(o)
+	err = manageDriftDetectionManagerDeploymentForHelm(ctx, c, clusterSummary, clusterNamespace, clusterName, clusterType,
+		isPullMode, startInMgmtCluster, logger)
+	if err != nil {
+		logger.V(logs.LogInfo).Error(err, "failed to manage DriftDetectionManager for helm")
+		return err
 	}
 
 	adminNamespace, adminName := getClusterSummaryAdmin(clusterSummary)
@@ -181,15 +174,23 @@ func deployHelmCharts(ctx context.Context, c client.Client,
 	}
 
 	if clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeContinuousWithDriftDetection {
+		clusterClient, err := getResourceSummaryClient(ctx, clusterNamespace, clusterName, clusterType, logger)
+		if err != nil {
+			return err
+		}
+
+		resourceSummaryNameInfo := getResourceSummaryNameInfo(clusterNamespace, applicant)
+
 		// Deploy resourceSummary
-		err = deployResourceSummaryInCluster(ctx, c, clusterNamespace, clusterName, clusterSummary.Name,
-			clusterType, nil, nil, helmResources, clusterSummary.Spec.ClusterProfileSpec.DriftExclusions, logger)
+		err = deployer.DeployResourceSummaryInCluster(ctx, clusterClient, resourceSummaryNameInfo, clusterNamespace, clusterName,
+			clusterSummary.Name, clusterType, nil, nil, helmResources, clusterSummary.Spec.ClusterProfileSpec.DriftExclusions,
+			logger)
 		if err != nil {
 			return err
 		}
 	}
 
-	profileOwnerRef, err := configv1beta1.GetProfileOwnerReference(clusterSummary)
+	profileRef, err := configv1beta1.GetProfileRef(clusterSummary)
 	if err != nil {
 		return err
 	}
@@ -199,9 +200,9 @@ func deployHelmCharts(ctx context.Context, c client.Client,
 	// in the managed cluster when a mounted ConfigMap/Secret is updated. In order to do so, sveltos-agent
 	// needs to be instructed which Deployment/StatefulSet/DaemonSet instances require this behavior.
 	// Update corresponding Reloader instance (instance will be deleted if Reloader is set to false)
-	resources := convertHelmResourcesToObjectReference(helmResources)
-	err = updateReloaderWithDeployedResources(ctx, c, profileOwnerRef, configv1beta1.FeatureHelm,
-		resources, clusterSummary, logger)
+	resources := clusterops.ConvertHelmResourcesToObjectReference(helmResources)
+	err = updateReloaderWithDeployedResources(ctx, clusterSummary, profileRef, libsveltosv1beta1.FeatureHelm,
+		resources, !clusterSummary.Spec.ClusterProfileSpec.Reloader, logger)
 	if err != nil {
 		return err
 	}
@@ -212,7 +213,42 @@ func deployHelmCharts(ctx context.Context, c client.Client,
 	if err != nil {
 		return err
 	}
-	return validateHealthPolicies(ctx, remoteRestConfig, clusterSummary, configv1beta1.FeatureHelm, logger)
+	return clusterops.ValidateHealthPolicies(ctx, remoteRestConfig, clusterSummary.Spec.ClusterProfileSpec.ValidateHealths,
+		libsveltosv1beta1.FeatureHelm, logger)
+}
+
+func manageDriftDetectionManagerDeploymentForHelm(ctx context.Context, c client.Client,
+	clusterSummary *configv1beta1.ClusterSummary, clusterNamespace, clusterName string,
+	clusterType libsveltosv1beta1.ClusterType, isPullMode, startInMgmtCluster bool, logger logr.Logger) error {
+
+	if clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeContinuousWithDriftDetection {
+		// Deploy drift detection manager first. Have manager up by the time resourcesummary is created
+		err := deployDriftDetectionManagerInCluster(ctx, c, clusterNamespace, clusterName, clusterSummary.Name,
+			string(libsveltosv1beta1.FeatureHelm), clusterType, isPullMode, startInMgmtCluster, logger)
+		if err != nil {
+			return err
+		}
+
+		clusterClient, err := getResourceSummaryClient(ctx, clusterNamespace, clusterName, clusterType, logger)
+		if err != nil {
+			return err
+		}
+
+		resourceSummaryNameInfo := getResourceSummaryNameInfo(clusterNamespace, clusterSummary.Name)
+
+		// Since we are updating resources to watch for drift, remove helm section in ResourceSummary to eliminate
+		// un-needed reconciliation (Sveltos is updating those resources so we don't want drift-detection to think
+		// a configuration drift is happening)
+		err = deployer.DeployResourceSummaryInCluster(ctx, clusterClient, resourceSummaryNameInfo, clusterNamespace, clusterName,
+			clusterSummary.Name, clusterType, nil, nil, []libsveltosv1beta1.HelmResources{}, clusterSummary.Spec.ClusterProfileSpec.DriftExclusions,
+			logger)
+		if err != nil {
+			logger.V(logs.LogInfo).Error(err, "failed to remove ResourceSummary.")
+			return err
+		}
+	}
+
+	return nil
 }
 
 func undeployHelmCharts(ctx context.Context, c client.Client,
@@ -220,9 +256,18 @@ func undeployHelmCharts(ctx context.Context, c client.Client,
 	clusterType libsveltosv1beta1.ClusterType,
 	o deployer.Options, logger logr.Logger) error {
 
+	// TODO: MGIANLUC
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, c, clusterNamespace, clusterName, clusterType, logger)
+	if err != nil {
+		return err
+	}
+	if isPullMode {
+		return nil
+	}
+
 	// Get ClusterSummary that requested this
 	clusterSummary := &configv1beta1.ClusterSummary{}
-	err := c.Get(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: applicant}, clusterSummary)
+	err = c.Get(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: applicant}, clusterSummary)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
@@ -270,19 +315,22 @@ func undeployHelmChartResources(ctx context.Context, c client.Client, clusterSum
 	}
 	releaseReports = append(releaseReports, undeployedReports...)
 
-	profileOwnerRef, err := configv1beta1.GetProfileOwnerReference(clusterSummary)
+	profileRef, err := configv1beta1.GetProfileRef(clusterSummary)
 	if err != nil {
 		return err
 	}
 
-	err = updateReloaderWithDeployedResources(ctx, c, profileOwnerRef, configv1beta1.FeatureKustomize,
-		nil, clusterSummary, logger)
+	err = updateReloaderWithDeployedResources(ctx, clusterSummary, profileRef, libsveltosv1beta1.FeatureKustomize,
+		nil, true, logger)
 	if err != nil {
 		return err
 	}
 
-	err = updateClusterConfiguration(ctx, c, clusterSummary, profileOwnerRef,
-		configv1beta1.FeatureHelm, nil, []configv1beta1.Chart{})
+	isDrynRun := clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun
+	clean := !clusterSummary.DeletionTimestamp.IsZero()
+	err = clusterops.UpdateClusterConfiguration(ctx, c, isDrynRun, clean, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType, profileRef, libsveltosv1beta1.FeatureHelm,
+		nil, []configv1beta1.Chart{})
 	if err != nil {
 		return err
 	}
@@ -395,10 +443,10 @@ func uninstallHelmCharts(ctx context.Context, c client.Client, clusterSummary *c
 	return releaseReports, nil
 }
 
-func helmHash(ctx context.Context, c client.Client, clusterSummaryScope *scope.ClusterSummaryScope,
+func helmHash(ctx context.Context, c client.Client, clusterSummary *configv1beta1.ClusterSummary,
 	logger logr.Logger) ([]byte, error) {
 
-	clusterProfileSpecHash, err := getClusterProfileSpecHash(ctx, clusterSummaryScope.ClusterSummary)
+	clusterProfileSpecHash, err := getClusterProfileSpecHash(ctx, clusterSummary)
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +455,6 @@ func helmHash(ctx context.Context, c client.Client, clusterSummaryScope *scope.C
 	var config string
 	config += string(clusterProfileSpecHash)
 
-	clusterSummary := clusterSummaryScope.ClusterSummary
 	if clusterSummary.Spec.ClusterProfileSpec.HelmCharts == nil {
 		return h.Sum(nil), nil
 	}
@@ -437,7 +484,7 @@ func helmHash(ctx context.Context, c client.Client, clusterSummaryScope *scope.C
 			}
 		}
 
-		valueFromHash, err := getHelmReferenceResourceHash(ctx, c, clusterSummaryScope.ClusterSummary,
+		valueFromHash, err := getHelmReferenceResourceHash(ctx, c, clusterSummary,
 			currentChart, logger)
 		if err != nil {
 			logger.V(logs.LogInfo).Info(
@@ -450,7 +497,7 @@ func helmHash(ctx context.Context, c client.Client, clusterSummaryScope *scope.C
 
 	for i := range clusterSummary.Spec.ClusterProfileSpec.ValidateHealths {
 		h := &clusterSummary.Spec.ClusterProfileSpec.ValidateHealths[i]
-		if h.FeatureID == configv1beta1.FeatureHelm {
+		if h.FeatureID == libsveltosv1beta1.FeatureHelm {
 			config += render.AsCode(h)
 		}
 	}
@@ -581,7 +628,7 @@ func walkChartsAndDeploy(ctx context.Context, c client.Client, clusterSummary *c
 			// when profile currently managing the helm chart is removed, all
 			// conflicting profiles will be automatically reconciled.
 			return releaseReports, chartDeployed,
-				&NonRetriableError{Message: conflictErrorMessage}
+				&configv1beta1.NonRetriableError{Message: conflictErrorMessage}
 		}
 
 		var report *configv1beta1.ReleaseReport
@@ -631,7 +678,7 @@ func walkChartsAndDeploy(ctx context.Context, c client.Client, clusterSummary *c
 		// for helm chart a conflict is a non retriable error.
 		// when profile currently managing the helm chart is removed, all
 		// conflicting profiles will be automatically reconciled.
-		return releaseReports, chartDeployed, &NonRetriableError{Message: conflictErrorMessage}
+		return releaseReports, chartDeployed, &configv1beta1.NonRetriableError{Message: conflictErrorMessage}
 	}
 
 	return releaseReports, chartDeployed, nil
@@ -697,7 +744,7 @@ func determineChartOwnership(ctx context.Context, c client.Client, claimingHelmM
 			return false, err
 		}
 
-		if hasHigherOwnershipPriority(currentHelmManager.Spec.ClusterProfileSpec.Tier, claimingHelmManager.Spec.ClusterProfileSpec.Tier) {
+		if deployer.HasHigherOwnershipPriority(currentHelmManager.Spec.ClusterProfileSpec.Tier, claimingHelmManager.Spec.ClusterProfileSpec.Tier) {
 			if claimingHelmManager.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun {
 				// Since we are in DryRun mode do not reset the other ClusterSummary. It will still be managing
 				// the helm chart
@@ -712,7 +759,7 @@ func determineChartOwnership(ctx context.Context, c client.Client, claimingHelmM
 			}
 
 			// Reset Status of the ClusterSummary previously managing this resource
-			err = requeueClusterSummary(ctx, configv1beta1.FeatureHelm, currentHelmManager, logger)
+			err = requeueClusterSummary(ctx, libsveltosv1beta1.FeatureHelm, currentHelmManager, logger)
 			if err != nil {
 				return false, err
 			}
@@ -1207,7 +1254,7 @@ func upgradeRelease(ctx context.Context, clusterSummary *configv1beta1.ClusterSu
 		return err
 	}
 
-	driftExclusionPatches := transformDriftExclusionsToPatches(clusterSummary.Spec.ClusterProfileSpec.DriftExclusions)
+	driftExclusionPatches := deployer.TransformDriftExclusionsToPatches(clusterSummary.Spec.ClusterProfileSpec.DriftExclusions)
 
 	patches, err := initiatePatches(ctx, clusterSummary, requestedChart.ChartName, mgmtResources, logger)
 	if err != nil {
@@ -1270,7 +1317,7 @@ func upgradeRelease(ctx context.Context, clusterSummary *configv1beta1.ClusterSu
 func upgradeCRDsInFile(ctx context.Context, dr dynamic.ResourceInterface, chartFile *chart.File,
 	logger logr.Logger) (int, error) {
 
-	crds, err := getUnstructured(chartFile.Data, logger)
+	crds, err := deployer.GetUnstructured(chartFile.Data, logger)
 	if err != nil {
 		return 0, err
 	}
@@ -1716,12 +1763,16 @@ func updateChartsInClusterConfiguration(ctx context.Context, c client.Client, cl
 
 	logger.V(logs.LogInfo).Info(fmt.Sprintf("update deployed chart info. Number of deployed helm chart: %d",
 		len(chartDeployed)))
-	profileOwnerRef, err := configv1beta1.GetProfileOwnerReference(clusterSummary)
+	profileRef, err := configv1beta1.GetProfileRef(clusterSummary)
 	if err != nil {
 		return err
 	}
 
-	return updateClusterConfiguration(ctx, c, clusterSummary, profileOwnerRef, configv1beta1.FeatureHelm, nil, chartDeployed)
+	isDryRun := clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun
+	clean := !clusterSummary.DeletionTimestamp.IsZero()
+	return clusterops.UpdateClusterConfiguration(ctx, c, isDryRun, clean, clusterSummary.Spec.ClusterNamespace,
+		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType, profileRef, libsveltosv1beta1.FeatureHelm,
+		nil, chartDeployed)
 }
 
 // undeployStaleReleases uninstalls all helm charts previously managed and not referenced anyomre
@@ -1997,7 +2048,7 @@ func updateClusterReportWithHelmReports(ctx context.Context, c client.Client,
 		return err
 	}
 
-	clusterReportName := getClusterReportName(profileOwnerRef.Kind, profileOwnerRef.Name,
+	clusterReportName := clusterops.GetClusterReportName(profileOwnerRef.Kind, profileOwnerRef.Name,
 		clusterSummary.Spec.ClusterName, clusterSummary.Spec.ClusterType)
 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -2130,7 +2181,7 @@ func collectResourcesFromManagedHelmChartsForDriftDetection(ctx context.Context,
 }
 
 func collectHelmContent(manifest string, logger logr.Logger) ([]*unstructured.Unstructured, error) {
-	elements, err := customSplit(manifest)
+	elements, err := deployer.CustomSplit(manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -2171,17 +2222,17 @@ func collectHelmContent(manifest string, logger logr.Logger) ([]*unstructured.Un
 	return resources, nil
 }
 
-func unstructuredToSveltosResources(policies []*unstructured.Unstructured) []libsveltosv1beta1.Resource {
-	resources := make([]libsveltosv1beta1.Resource, len(policies))
+func unstructuredToSveltosResources(policies []*unstructured.Unstructured) []libsveltosv1beta1.ResourceSummaryResource {
+	resources := make([]libsveltosv1beta1.ResourceSummaryResource, len(policies))
 
 	for i := range policies {
-		r := libsveltosv1beta1.Resource{
+		r := libsveltosv1beta1.ResourceSummaryResource{
 			Namespace:                   policies[i].GetNamespace(),
 			Name:                        policies[i].GetName(),
 			Kind:                        policies[i].GetKind(),
 			Group:                       policies[i].GetObjectKind().GroupVersionKind().Group,
 			Version:                     policies[i].GetObjectKind().GroupVersionKind().Version,
-			IgnoreForConfigurationDrift: hasIgnoreConfigurationDriftAnnotation(policies[i]),
+			IgnoreForConfigurationDrift: deployer.HasIgnoreConfigurationDriftAnnotation(policies[i]),
 		}
 
 		resources[i] = r
@@ -2575,7 +2626,10 @@ func addExtraMetadata(ctx context.Context, requestedChart *configv1beta1.HelmCha
 		addExtraLabels(r, clusterSummary.Spec.ClusterProfileSpec.ExtraLabels)
 		addExtraAnnotations(r, clusterSummary.Spec.ClusterProfileSpec.ExtraAnnotations)
 
-		_, err = updateResource(ctx, dr, clusterSummary, r, []string{}, logger)
+		isDriftDetection := clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeContinuousWithDriftDetection
+		isDryRun := clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun
+		_, err = deployer.UpdateResource(ctx, dr, isDriftDetection, isDryRun, clusterSummary.Spec.ClusterProfileSpec.DriftExclusions,
+			r, []string{}, logger)
 		if err != nil {
 			logger.V(logs.LogInfo).Info(fmt.Sprintf("failed to update resource %s %s/%s: %v",
 				r.GetKind(), r.GetNamespace(), r.GetName(), err))
@@ -2933,7 +2987,7 @@ func requeueAllOtherClusterSummaries(ctx context.Context, c client.Client,
 			return err
 		}
 
-		err = requeueClusterSummary(ctx, configv1beta1.FeatureHelm, cs, logger)
+		err = requeueClusterSummary(ctx, libsveltosv1beta1.FeatureHelm, cs, logger)
 		if err != nil {
 			return err
 		}
@@ -3108,4 +3162,38 @@ func canManageChart(ctx context.Context, c client.Client, clusterSummary *config
 	}
 
 	return determineChartOwnership(ctx, c, clusterSummary, instantiatedChart, logger)
+}
+
+// addExtraLabels adds ExtraLabels to policy.
+// If policy already has a label with a key present in `ExtraLabels`, the value from `ExtraLabels` will
+// override the existing value.
+func addExtraLabels(policy *unstructured.Unstructured, extraLabels map[string]string) {
+	if extraLabels == nil {
+		return
+	}
+
+	if len(extraLabels) == 0 {
+		return
+	}
+
+	for k := range extraLabels {
+		deployer.AddLabel(policy, k, extraLabels[k])
+	}
+}
+
+// addExtraAnnotations adds ExtraAnnotations to policy.
+// If policy already has an annotation with a key present in `ExtraAnnotations`, the value from `ExtraAnnotations`
+// will override the existing value.
+func addExtraAnnotations(policy *unstructured.Unstructured, extraAnnotations map[string]string) {
+	if extraAnnotations == nil {
+		return
+	}
+
+	if len(extraAnnotations) == 0 {
+		return
+	}
+
+	for k := range extraAnnotations {
+		deployer.AddAnnotation(policy, k, extraAnnotations[k])
+	}
 }

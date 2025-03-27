@@ -4968,6 +4968,8 @@ rules:
   - lib.projectsveltos.io
   resources:
   - clustersets
+  - configurationbundles
+  - configurationgroups
   - reloaders
   - resourcesummaries
   - sets
@@ -4998,6 +5000,16 @@ rules:
 - apiGroups:
   - lib.projectsveltos.io
   resources:
+  - configurationbundles/status
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - lib.projectsveltos.io
+  resources:
+  - configurationgroups/status
   - debuggingconfigurations
   - sveltosclusters
   - sveltosclusters/status

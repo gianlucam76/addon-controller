@@ -40,6 +40,7 @@ import (
 
 	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
 	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
 	"github.com/projectsveltos/addon-controller/pkg/scope"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
 	"github.com/projectsveltos/libsveltos/lib/deployer"
@@ -79,7 +80,7 @@ var _ = Describe("HandlersResource", func() {
 			},
 		}
 
-		clusterSummaryName := controllers.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
+		clusterSummaryName := clusterops.GetClusterSummaryName(configv1beta1.ClusterProfileKind,
 			clusterProfile.Name, cluster.Name, false)
 		clusterSummary = &configv1beta1.ClusterSummary{
 			ObjectMeta: metav1.ObjectMeta{
@@ -138,7 +139,7 @@ var _ = Describe("HandlersResource", func() {
 		// Eventual loop so testEnv Cache is synced
 		Eventually(func() error {
 			return controllers.GenericDeploy(ctx, testEnv.Client, cluster.Namespace, cluster.Name, clusterSummary.Name,
-				string(configv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+				string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
 				textlogger.NewLogger(textlogger.NewConfig()))
 		}, timeout, pollingInterval).Should(BeNil())
 
@@ -164,7 +165,7 @@ var _ = Describe("HandlersResource", func() {
 					deployer.ReferenceKindLabel:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
 					deployer.ReferenceNameLabel:      randomString(),
 					deployer.ReferenceNamespaceLabel: randomString(),
-					controllers.ReasonLabel:          string(configv1beta1.FeatureResources),
+					deployer.ReasonLabel:             string(libsveltosv1beta1.FeatureResources),
 				},
 			},
 		}
@@ -183,7 +184,7 @@ var _ = Describe("HandlersResource", func() {
 					deployer.ReferenceKindLabel:      string(libsveltosv1beta1.ConfigMapReferencedResourceKind),
 					deployer.ReferenceNameLabel:      randomString(),
 					deployer.ReferenceNamespaceLabel: randomString(),
-					controllers.ReasonLabel:          string(configv1beta1.FeatureResources),
+					deployer.ReasonLabel:             string(libsveltosv1beta1.FeatureResources),
 				},
 			},
 		}
@@ -203,13 +204,13 @@ var _ = Describe("HandlersResource", func() {
 			currentClusterSummary)).To(Succeed())
 		currentClusterSummary.Status.FeatureSummaries = []configv1beta1.FeatureSummary{
 			{
-				FeatureID: configv1beta1.FeatureResources,
-				Status:    configv1beta1.FeatureStatusProvisioned,
+				FeatureID: libsveltosv1beta1.FeatureResources,
+				Status:    libsveltosv1beta1.FeatureStatusProvisioned,
 			},
 		}
-		currentClusterSummary.Status.DeployedGVKs = []configv1beta1.FeatureDeploymentInfo{
+		currentClusterSummary.Status.DeployedGVKs = []libsveltosv1beta1.FeatureDeploymentInfo{
 			{
-				FeatureID: configv1beta1.FeatureResources,
+				FeatureID: libsveltosv1beta1.FeatureResources,
 				DeployedGroupVersionKind: []string{
 					"ClusterRole.v1.rbac.authorization.k8s.io",
 					"Role.v1.rbac.authorization.k8s.io",
@@ -228,7 +229,7 @@ var _ = Describe("HandlersResource", func() {
 		}, timeout, pollingInterval).Should(BeTrue())
 
 		Expect(controllers.GenericUndeploy(ctx, testEnv.Client, cluster.Namespace, cluster.Name, clusterSummary.Name,
-			string(configv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
+			string(libsveltosv1beta1.FeatureResources), libsveltosv1beta1.ClusterTypeCapi, deployer.Options{},
 			textlogger.NewLogger(textlogger.NewConfig()))).To(Succeed())
 
 		// UnDeployResources finds all policies deployed because of a clusterSummary and deletes those.
@@ -259,9 +260,9 @@ var _ = Describe("HandlersResource", func() {
 	It("updateDeployedGroupVersionKind updates ClusterSummary Status with list of deployed GroupVersionKinds", func() {
 		Expect(waitForObject(context.TODO(), testEnv.Client, clusterProfile)).To(Succeed())
 
-		localReports := []configv1beta1.ResourceReport{
+		localReports := []libsveltosv1beta1.ResourceReport{
 			{
-				Resource: configv1beta1.Resource{
+				Resource: libsveltosv1beta1.Resource{
 					Name:      randomString(),
 					Namespace: randomString(),
 					Group:     randomString(),
@@ -271,9 +272,9 @@ var _ = Describe("HandlersResource", func() {
 			},
 		}
 
-		remoteReports := []configv1beta1.ResourceReport{
+		remoteReports := []libsveltosv1beta1.ResourceReport{
 			{
-				Resource: configv1beta1.Resource{
+				Resource: libsveltosv1beta1.Resource{
 					Name:      randomString(),
 					Namespace: randomString(),
 					Group:     randomString(),
@@ -283,7 +284,7 @@ var _ = Describe("HandlersResource", func() {
 			},
 		}
 
-		_, err := controllers.UpdateDeployedGroupVersionKind(context.TODO(), clusterSummary, configv1beta1.FeatureResources,
+		_, err := controllers.UpdateDeployedGroupVersionKind(context.TODO(), clusterSummary, libsveltosv1beta1.FeatureResources,
 			localReports, remoteReports, textlogger.NewLogger(textlogger.NewConfig()))
 		Expect(err).To(BeNil())
 
@@ -300,7 +301,7 @@ var _ = Describe("HandlersResource", func() {
 			clusterSummary)).To(Succeed())
 		Expect(clusterSummary.Status.DeployedGVKs).ToNot(BeNil())
 		Expect(len(clusterSummary.Status.DeployedGVKs)).To(Equal(1))
-		Expect(clusterSummary.Status.DeployedGVKs[0].FeatureID).To(Equal(configv1beta1.FeatureResources))
+		Expect(clusterSummary.Status.DeployedGVKs[0].FeatureID).To(Equal(libsveltosv1beta1.FeatureResources))
 		Expect(clusterSummary.Status.DeployedGVKs[0].DeployedGroupVersionKind).To(ContainElement(
 			fmt.Sprintf("%s.%s.%s", localReports[0].Resource.Kind, localReports[0].Resource.Version, localReports[0].Resource.Group)))
 		Expect(clusterSummary.Status.DeployedGVKs[0].DeployedGroupVersionKind).To(ContainElement(
@@ -417,7 +418,8 @@ var _ = Describe("Hash methods", func() {
 		h.Write([]byte(config))
 		expectHash := h.Sum(nil)
 
-		hash, err := controllers.ResourcesHash(context.TODO(), c, clusterSummaryScope, textlogger.NewLogger(textlogger.NewConfig()))
+		hash, err := controllers.ResourcesHash(context.TODO(), c, clusterSummaryScope.ClusterSummary,
+			textlogger.NewLogger(textlogger.NewConfig()))
 		Expect(err).To(BeNil())
 		Expect(reflect.DeepEqual(hash, expectHash)).To(BeTrue())
 	})
