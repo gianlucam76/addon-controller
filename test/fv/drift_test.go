@@ -33,7 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
-	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
 )
 
@@ -115,7 +115,7 @@ var _ = Describe("Helm", Serial, func() {
 
 		verifyClusterProfileMatches(clusterProfile)
 
-		verifyClusterSummary(controllers.ClusterProfileLabelName,
+		verifyClusterSummary(clusterops.ClusterProfileLabelName,
 			clusterProfile.Name, &clusterProfile.Spec, kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
 		livenessPeriodSecond := int32(31)
@@ -190,7 +190,7 @@ reportsController:
 		}
 
 		By("use driftExclusion to ignore cleanup controller spec/replicas changes")
-		currentClusterProfile.Spec.DriftExclusions = []configv1beta1.DriftExclusion{
+		currentClusterProfile.Spec.DriftExclusions = []libsveltosv1beta1.DriftExclusion{
 			{
 				Paths: []string{"/spec/replicas"},
 				Target: &libsveltosv1beta1.PatchSelector{
@@ -221,7 +221,7 @@ reportsController:
 
 		Expect(k8sClient.Update(context.TODO(), currentClusterProfile)).To(Succeed())
 
-		clusterSummary := verifyClusterSummary(controllers.ClusterProfileLabelName,
+		clusterSummary := verifyClusterSummary(clusterops.ClusterProfileLabelName,
 			currentClusterProfile.Name, &currentClusterProfile.Spec,
 			kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
@@ -287,14 +287,14 @@ reportsController:
 		}
 
 		Byf("Verifying ClusterSummary %s status is set to Deployed for Helm feature", clusterSummary.Name)
-		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.Namespace, clusterSummary.Name, configv1beta1.FeatureHelm)
+		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.Namespace, clusterSummary.Name, libsveltosv1beta1.FeatureHelm)
 
 		charts := []configv1beta1.Chart{
 			{ReleaseName: "kyverno-latest", ChartVersion: "3.2.6", Namespace: "kyverno"},
 		}
 
 		verifyClusterConfiguration(configv1beta1.ClusterProfileKind, clusterProfile.Name,
-			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, configv1beta1.FeatureHelm,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, libsveltosv1beta1.FeatureHelm,
 			nil, charts)
 
 		if isAgentLessMode() {
@@ -521,24 +521,51 @@ func verifyResourceSummary(c client.Client, clusterSummary *configv1beta1.Cluste
 	// drift (by adding annotation projectsveltos.io/driftDetectionIgnore)
 	Byf("Verify deployment %s/%s is marked to be ignored for configuration drift",
 		kyvernoNamespace, admissionControllerDeplName)
-	found := false
+	Eventually(func() bool {
+		resourceSummaries := &libsveltosv1beta1.ResourceSummaryList{}
+		err := c.List(context.TODO(), resourceSummaries, listOptions...)
+		if err != nil {
+			return false
+		}
+		if len(resourceSummaries.Items) != 1 {
+			return false
+		}
+
+		currentResourceSummary := &resourceSummaries.Items[0]
+
+		found := false
+		ignore := false
+		for i := range currentResourceSummary.Spec.ChartResources {
+			for j := range currentResourceSummary.Spec.ChartResources[i].Resources {
+				r := &currentResourceSummary.Spec.ChartResources[i].Resources[j]
+				if r.Kind == deploymentKind && r.Namespace == kyvernoNamespace &&
+					r.Name == admissionControllerDeplName {
+
+					ignore = r.IgnoreForConfigurationDrift
+					found = true
+					break
+				}
+			}
+		}
+		return found && ignore
+	}, timeout, pollingInterval).Should(BeTrue())
+
+	// DriftExclusion has been configured to NOT ignore for anything else
 	for i := range currentResourceSummary.Spec.ChartResources {
 		for j := range currentResourceSummary.Spec.ChartResources[i].Resources {
 			r := &currentResourceSummary.Spec.ChartResources[i].Resources[j]
 			if r.Kind == deploymentKind && r.Namespace == kyvernoNamespace &&
 				r.Name == admissionControllerDeplName {
 
-				Expect(r.IgnoreForConfigurationDrift).To(BeTrue())
-				found = true
+				continue
 			} else {
 				Expect(r.IgnoreForConfigurationDrift).To(BeFalse())
 			}
 		}
 	}
-	Expect(found).To(BeTrue())
 
+	found := false
 	// DriftExclusion has been configured to ignore cleanup controller spec/replicas
-	found = false
 	Byf("Verify deployment %s/%s spec/replicas is marked to be ignored for configuration drift",
 		kyvernoNamespace, cleanupControllerDeplName)
 	for i := range currentResourceSummary.Spec.Patches {

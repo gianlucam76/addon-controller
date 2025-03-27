@@ -38,6 +38,8 @@ require (
 	sigs.k8s.io/kustomize/kyaml v0.19.0
 )
 
+replace github.com/projectsveltos/libsveltos => github.com/gianlucam76/libsveltos v0.0.0-20250526113952-68f50b0067d5
+
 require (
 	cel.dev/expr v0.19.1 // indirect
 	github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 // indirect
