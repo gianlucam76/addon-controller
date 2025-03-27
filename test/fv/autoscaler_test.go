@@ -28,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
-	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
 	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
 )
 
@@ -86,7 +86,7 @@ var _ = Describe("Feature", func() {
 
 		verifyClusterProfileMatches(clusterProfile)
 
-		verifyClusterSummary(controllers.ClusterProfileLabelName, clusterProfile.Name, &clusterProfile.Spec,
+		verifyClusterSummary(clusterops.ClusterProfileLabelName, clusterProfile.Name, &clusterProfile.Spec,
 			kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
 		configMapNs := defaultNamespace
@@ -146,7 +146,7 @@ var _ = Describe("Feature", func() {
 		}
 		Expect(k8sClient.Update(context.TODO(), currentClusterProfile)).To(Succeed())
 
-		clusterSummary := verifyClusterSummary(controllers.ClusterProfileLabelName, clusterProfile.Name,
+		clusterSummary := verifyClusterSummary(clusterops.ClusterProfileLabelName, clusterProfile.Name,
 			&currentClusterProfile.Spec, kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
 		Byf("Verifying autoscaler serviceAccount has been created into management cluster")
@@ -195,7 +195,7 @@ var _ = Describe("Feature", func() {
 		Expect(workloadCurrentSecret.Data["ca.crt"]).To(Equal(mgmtCurrentSecret.Data["ca.crt"]))
 
 		Byf("Verifying ClusterSummary %s status is set to Deployed for Resources feature", clusterSummary.Name)
-		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.Namespace, clusterSummary.Name, configv1beta1.FeatureResources)
+		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.Namespace, clusterSummary.Name, libsveltosv1beta1.FeatureResources)
 
 		deleteClusterProfile(clusterProfile)
 

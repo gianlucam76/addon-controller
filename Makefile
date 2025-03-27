@@ -27,7 +27,7 @@ OS ?= $(shell uname -s)
 OS := $(shell echo $(OS) | tr '[:upper:]' '[:lower:]')
 K8S_LATEST_VER ?= $(shell curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)
 export CONTROLLER_IMG ?= $(REGISTRY)/$(IMAGE_NAME)
-TAG ?= main
+TAG ?= pull-mode
 
 .PHONY: all
 all: build
@@ -439,4 +439,3 @@ drift-detection-manager:
 	cd pkg/drift-detection; go generate
 	@echo "Downloading drift detection manager common yaml for agentless fv"
 	curl -L -H "Authorization: token $$GITHUB_PAT" https://raw.githubusercontent.com/projectsveltos/drift-detection-manager/$(TAG)/manifest/mgmt_cluster_common_manifest.yaml -o ./test/drift-detection-mgmt_cluster_common_manifest.yaml
-

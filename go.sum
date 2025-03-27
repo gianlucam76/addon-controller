@@ -139,6 +139,8 @@ github.com/fxamacker/cbor/v2 v2.7.0 h1:iM5WgngdRBanHcxugY4JySA0nk1wZorNOpTgCMedv
 github.com/fxamacker/cbor/v2 v2.7.0/go.mod h1:pxXPTn3joSm21Gbwsv0w9OSA2y1HFR9qXEeXQVeNoDQ=
 github.com/gdexlab/go-render v1.0.1 h1:rxqB3vo5s4n1kF0ySmoNeSPRYkEsyHgln4jFIQY7v0U=
 github.com/gdexlab/go-render v1.0.1/go.mod h1:wRi5nW2qfjiGj4mPukH4UV0IknS1cHD4VgFTmJX5JzM=
+github.com/gianlucam76/libsveltos v0.0.0-20250506074355-85b5a10d39f5 h1:FWZypc/2U3KBrQ20EvFfkDG6YKpMPaWdqZ8OGur8vRQ=
+github.com/gianlucam76/libsveltos v0.0.0-20250506074355-85b5a10d39f5/go.mod h1:IZ6rlFGS7rS9DdfFyJeHJzBmINAjUmxrltoChaH4/f8=
 github.com/go-errors/errors v1.5.1 h1:ZwEMSLRCapFLflTpT7NKaAc7ukJ8ZPEjzlxt8rPN8bk=
 github.com/go-errors/errors v1.5.1/go.mod h1:sIVyrIiJhuEF+Pj9Ebtd6P/rEYROXFi3BopGUQ5a5Og=
 github.com/go-gorp/gorp/v3 v3.1.0 h1:ItKF/Vbuj31dmV4jxA1qblpSwkl9g1typ24xoe70IGs=
@@ -329,8 +331,6 @@ github.com/poy/onpar v1.1.2 h1:QaNrNiZx0+Nar5dLgTVp5mXkyoVFIbepjyEoGSnhbAY=
 github.com/poy/onpar v1.1.2/go.mod h1:6X8FLNoxyr9kkmnlqpK6LSoiOtrO6MICtWwEuWkLjzg=
 github.com/prashantv/gostub v1.1.0 h1:BTyx3RfQjRHnUWaGF9oQos79AlQ5k8WNktv7VGvVH4g=
 github.com/prashantv/gostub v1.1.0/go.mod h1:A5zLQHz7ieHGG7is6LLXLz7I8+3LZzsrV0P1IAHhP5U=
-github.com/projectsveltos/libsveltos v0.53.1-0.20250506070210-ef75a78e70a1 h1:62mLgYOrZiqhMD6vc8JcndMs8obZpq+tfvNePsi774Y=
-github.com/projectsveltos/libsveltos v0.53.1-0.20250506070210-ef75a78e70a1/go.mod h1:sqZMoHeBgXY6cMIRrByGsdZxpOmwdK+p/H3G81yZ6q0=
 github.com/projectsveltos/lua-utils/glua-json v0.0.0-20250301182851-e4fbb9fd7ff7 h1:KdDtBEJPgavOHlut1gq2i6bFm5dgoNHNsOUC8oe2hK4=
 github.com/projectsveltos/lua-utils/glua-json v0.0.0-20250301182851-e4fbb9fd7ff7/go.mod h1:AIzg+JWbfrFWazyM5Ka2fX69r9aFr3+o2Mvn9SfKDYU=
 github.com/projectsveltos/lua-utils/glua-runes v0.0.0-20250301182851-e4fbb9fd7ff7 h1:kZzOx+XTEfCRjxw1yACuGhFSyS7ybP/NNJFAZYNARCk=

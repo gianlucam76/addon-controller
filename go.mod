@@ -37,6 +37,8 @@ require (
 	sigs.k8s.io/kustomize/kyaml v0.19.0
 )
 
+replace github.com/projectsveltos/libsveltos => github.com/gianlucam76/libsveltos v0.0.0-20250506074355-85b5a10d39f5
+
 require (
 	cel.dev/expr v0.19.1 // indirect
 	dario.cat/mergo v1.0.1 // indirect

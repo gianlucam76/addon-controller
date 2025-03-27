@@ -29,7 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	configv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
-	"github.com/projectsveltos/addon-controller/controllers"
+	"github.com/projectsveltos/addon-controller/lib/clusterops"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
 )
 
 /*
@@ -50,7 +51,7 @@ var _ = Describe("Kustomize with GitRepository", func() {
 
 		verifyClusterProfileMatches(clusterProfile)
 
-		verifyClusterSummary(controllers.ClusterProfileLabelName,
+		verifyClusterSummary(clusterops.ClusterProfileLabelName,
 			clusterProfile.Name, &clusterProfile.Spec,
 			kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
@@ -87,7 +88,7 @@ var _ = Describe("Kustomize with GitRepository", func() {
 				gitRepository.Status.Artifact != nil
 		}, timeout, pollingInterval).Should(BeTrue())
 
-		clusterSummary := verifyClusterSummary(controllers.ClusterProfileLabelName,
+		clusterSummary := verifyClusterSummary(clusterops.ClusterProfileLabelName,
 			currentClusterProfile.Name, &currentClusterProfile.Spec,
 			kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
@@ -121,7 +122,7 @@ var _ = Describe("Kustomize with GitRepository", func() {
 		}, timeout, pollingInterval).Should(BeTrue())
 
 		Byf("Verifying ClusterSummary %s status is set to Deployed for kustomize", clusterSummary.Name)
-		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.Namespace, clusterSummary.Name, configv1beta1.FeatureKustomize)
+		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.Namespace, clusterSummary.Name, libsveltosv1beta1.FeatureKustomize)
 
 		currentConfigMap := &corev1.ConfigMap{}
 		Expect(workloadClient.Get(context.TODO(),
@@ -141,7 +142,7 @@ var _ = Describe("Kustomize with GitRepository", func() {
 			{kind: "Deployment", name: currentDeployment.Name, namespace: targetNamespace, group: "apps"},
 		}
 		verifyClusterConfiguration(configv1beta1.ClusterProfileKind, clusterProfile.Name,
-			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, configv1beta1.FeatureKustomize,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, libsveltosv1beta1.FeatureKustomize,
 			policies, nil)
 
 		Byf("Changing clusterprofile to not reference GitRepository anymore")
@@ -149,7 +150,7 @@ var _ = Describe("Kustomize with GitRepository", func() {
 		currentClusterProfile.Spec.KustomizationRefs = []configv1beta1.KustomizationRef{}
 		Expect(k8sClient.Update(context.TODO(), currentClusterProfile)).To(Succeed())
 
-		verifyClusterSummary(controllers.ClusterProfileLabelName,
+		verifyClusterSummary(clusterops.ClusterProfileLabelName,
 			currentClusterProfile.Name, &currentClusterProfile.Spec,
 			kindWorkloadCluster.Namespace, kindWorkloadCluster.Name)
 
