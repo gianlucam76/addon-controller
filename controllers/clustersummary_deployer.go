@@ -78,6 +78,7 @@ func (r *ClusterSummaryReconciler) deployFeature(ctx context.Context, clusterSum
 		"applicant", clusterSummary.Name,
 		"feature", string(f.id))
 	logger.V(logs.LogDebug).Info("request to deploy")
+	logContentSummary(clusterSummary, f.id, logger)
 
 	r.Deployer.CleanupEntries(clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, clusterSummary.Name,
 		string(f.id), clusterSummary.Spec.ClusterType, true)
@@ -107,7 +108,7 @@ func (r *ClusterSummaryReconciler) deployFeature(ctx context.Context, clusterSum
 		clusterSummaryScope.ResetConsecutiveFailures(f.id)
 	}
 
-	if !r.shouldRedeploy(clusterSummaryScope, f, isConfigSame, logger) {
+	if !r.shouldRedeploy(ctx, clusterSummaryScope, f, isConfigSame, logger) {
 		logger.V(logs.LogDebug).Info("no need to redeploy")
 		return nil
 	}
@@ -251,6 +252,14 @@ func (r *ClusterSummaryReconciler) undeployFeature(ctx context.Context, clusterS
 		return nil
 	}
 
+	return r.processUndeployResult(ctx, clusterSummaryScope, f, logger)
+}
+
+func (r *ClusterSummaryReconciler) processUndeployResult(ctx context.Context, clusterSummaryScope *scope.ClusterSummaryScope,
+	f feature, logger logr.Logger) error {
+
+	clusterSummary := clusterSummaryScope.ClusterSummary
+
 	result := r.Deployer.GetResult(ctx, clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName,
 		clusterSummaryScope.Name(), string(f.id), clusterSummary.Spec.ClusterType, true)
 	status := r.convertResultStatus(result)
@@ -266,10 +275,25 @@ func (r *ClusterSummaryReconciler) undeployFeature(ctx context.Context, clusterS
 		// Failure to undeploy because of missing permission is ignored.
 		if apierrors.IsForbidden(result.Err) {
 			logger.V(logs.LogInfo).Info("undeploying failing because of missing permission.")
-			tmpStatus := libsveltosv1beta1.FeatureStatusRemoved
+			tmpStatus := libsveltosv1beta1.FeatureStatusRemoving
 			status = &tmpStatus
 			r.updateFeatureStatus(clusterSummaryScope, f.id, status, nil, result.Err, logger)
 			return nil
+		}
+
+		var handOverError *configv1beta1.HandOverError
+		if errors.As(result.Err, &handOverError) {
+			clusterSummaryScope.ClusterSummary.Status.NextReconcileTime =
+				&metav1.Time{Time: time.Now().Add(time.Minute)}
+			return result.Err
+		}
+
+		var nonRetriableError *configv1beta1.NonRetriableError
+		if errors.As(result.Err, &nonRetriableError) {
+			tmpStatus := libsveltosv1beta1.FeatureStatusRemoving
+			status = &tmpStatus
+			r.updateFeatureStatus(clusterSummaryScope, f.id, status, nil, result.Err, logger)
+			return result.Err
 		}
 
 		if *status == libsveltosv1beta1.FeatureStatusRemoved {
@@ -374,11 +398,29 @@ func (r *ClusterSummaryReconciler) verifyAgentDeployedContent(ctx context.Contex
 	}
 
 	if cgStatus != nil {
-		clusterSummary.Status.DeployedGVKs = []libsveltosv1beta1.FeatureDeploymentInfo{
-			{
-				FeatureID:                f.id,
-				DeployedGroupVersionKind: cgStatus.DeployedGroupVersionKind,
-			},
+		// Some GVK might have been deployed to the management cluster. Always append
+		// ConfigurationGroup only contains what has been deployed to the managed cluster
+		deployedGVKs := tranformGroupVersionKindToString(getDeployedGroupVersionKinds(clusterSummary, f.id))
+		deployedGVKs = append(deployedGVKs, cgStatus.DeployedGroupVersionKind...)
+		deployedGVKs = unique(deployedGVKs)
+
+		found := false
+		for i := range clusterSummary.Status.DeployedGVKs {
+			if clusterSummary.Status.DeployedGVKs[i].FeatureID == f.id {
+				// Update existing entry
+				clusterSummary.Status.DeployedGVKs[i].DeployedGroupVersionKind = deployedGVKs
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// Append new entry
+			clusterSummary.Status.DeployedGVKs = append(clusterSummary.Status.DeployedGVKs,
+				libsveltosv1beta1.FeatureDeploymentInfo{
+					FeatureID:                f.id,
+					DeployedGroupVersionKind: deployedGVKs,
+				})
 		}
 	}
 
@@ -568,8 +610,9 @@ func (r *ClusterSummaryReconciler) convertResultStatus(result deployer.Result) *
 }
 
 // shouldRedeploy returns true if this feature requires to be redeployed.
-func (r *ClusterSummaryReconciler) shouldRedeploy(clusterSummaryScope *scope.ClusterSummaryScope,
-	f feature, isConfigSame bool, logger logr.Logger) bool {
+func (r *ClusterSummaryReconciler) shouldRedeploy(ctx context.Context,
+	clusterSummaryScope *scope.ClusterSummaryScope, f feature, isConfigSame bool,
+	logger logr.Logger) bool {
 
 	if clusterSummaryScope.IsDryRunSync() {
 		logger.V(logs.LogDebug).Info("dry run mode. Always redeploy.")
@@ -593,6 +636,29 @@ func (r *ClusterSummaryReconciler) shouldRedeploy(clusterSummaryScope *scope.Clu
 		// feature is deployed and nothing has changed. Nothing to do.
 		logger.V(logs.LogDebug).Info("feature is deployed and hash has not changed")
 		return false
+	}
+
+	cs := clusterSummaryScope.ClusterSummary
+	isPullMode, err := clusterproxy.IsClusterInPullMode(ctx, r.Client, cs.Spec.ClusterNamespace,
+		cs.Spec.ClusterName, cs.Spec.ClusterType, logger)
+	if err != nil {
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("failed to check if cluster is pullmode: %v", err))
+		return true
+	}
+
+	if isPullMode {
+		status, err := pullmode.GetResourceDeploymentStatus(ctx, r.Client, cs.Spec.ClusterNamespace,
+			cs.Spec.ClusterName, cs.Kind, cs.Name, string(f.id), logger)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.V(logs.LogDebug).Info(fmt.Sprintf("failed to check applier status: %v", err))
+			}
+			return true
+		}
+		if status == nil {
+			logger.V(logs.LogDebug).Info("cluster in pull mode and applier is still processing it")
+			return false
+		}
 	}
 
 	return true
@@ -672,4 +738,15 @@ func (r *ClusterSummaryReconciler) maxNumberOfConsecutiveFailureReached(clusterS
 	}
 
 	return false
+}
+
+func logContentSummary(clusterSummary *configv1beta1.ClusterSummary, fID libsveltosv1beta1.FeatureID, logger logr.Logger) {
+	switch fID {
+	case libsveltosv1beta1.FeatureHelm:
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("HelmCharts: %d", len(clusterSummary.Spec.ClusterProfileSpec.HelmCharts)))
+	case libsveltosv1beta1.FeatureResources:
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("PolicyRefs: %d", len(clusterSummary.Spec.ClusterProfileSpec.PolicyRefs)))
+	case libsveltosv1beta1.FeatureKustomize:
+		logger.V(logs.LogDebug).Info(fmt.Sprintf("KustomizationRefs: %d", len(clusterSummary.Spec.ClusterProfileSpec.KustomizationRefs)))
+	}
 }
