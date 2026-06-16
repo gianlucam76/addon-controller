@@ -1236,6 +1236,114 @@ func handleCharts(ctx context.Context, clusterSummary *configv1beta1.ClusterSumm
 	return nil
 }
 
+// chartStepResult carries the outcome of deploying a single Helm chart within the walk loop.
+// A nil pointer means the caller should return the accompanying error immediately.
+type chartStepResult struct {
+	report        *configv1beta1.ReleaseReport
+	deployedChart *configv1beta1.Chart
+	conflictMsg   string // non-empty when this chart is in conflict (ContinueOnConflict path)
+	accumErr      string // non-empty when handleChart failed and ContinueOnError is set
+}
+
+// deploySingleChart processes one Helm chart entry from the ClusterSummary spec.
+// It returns (nil, err) for any fatal condition that should abort the outer loop,
+// or (step, nil) when the outer loop should accumulate the result and continue.
+func deploySingleChart(ctx context.Context, c client.Client, dCtx *deploymentContext,
+	currentChart *configv1beta1.HelmChart, kubeconfig string, isPullMode bool,
+	logger logr.Logger) (*chartStepResult, error) {
+
+	instantiatedChart, err := getInstantiatedChart(ctx, dCtx, currentChart, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	l := logger.WithValues("chart", fmt.Sprintf("%s/%s", instantiatedChart.ReleaseNamespace, instantiatedChart.ReleaseName))
+	l.V(logs.LogDebug).Info(fmt.Sprintf("Deploying chart: %v", instantiatedChart))
+
+	// Eventual conflicts are already resolved before this method is called
+	// So it is safe to call CanManageChart here
+	canManage, err := canManageChart(ctx, c, dCtx.clusterSummary, instantiatedChart, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	if !canManage {
+		report, err := createReportForUnmanagedHelmRelease(ctx, c, dCtx.clusterSummary, instantiatedChart, logger)
+		if err != nil {
+			return nil, err
+		}
+		conflictMsg := generateConflictForHelmChart(ctx, dCtx.clusterSummary, instantiatedChart)
+		// error is reported above, in updateStatusForReferencedHelmReleases.
+		if dCtx.clusterSummary.Spec.ClusterProfileSpec.ContinueOnConflict ||
+			dCtx.clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun {
+
+			return &chartStepResult{report: report, conflictMsg: conflictMsg}, nil
+		}
+		// for helm chart a conflict is a non retriable error.
+		// when profile currently managing the helm chart is removed, all
+		// conflicting profiles will be automatically reconciled.
+		return nil, &configv1beta1.NonRetriableError{Message: conflictMsg}
+	}
+
+	// We are the current manager for this chart. If our tier has risen above a waiting
+	// challenger's tier, requeue that challenger and yield immediately — there is no point
+	// deploying a chart we are about to hand over. The challenger will call
+	// determineChartOwnership on its next reconciliation, win the tier comparison, and
+	// requeue us at that point.
+	requeued, err := requeueLowerTierChallengers(ctx, c, dCtx.clusterSummary, instantiatedChart, l)
+	if err != nil {
+		return nil, err
+	}
+	if requeued {
+		return nil, fmt.Errorf("chart %s/%s yielded to lower-tier profile; will re-evaluate ownership after handover",
+			instantiatedChart.ReleaseNamespace, instantiatedChart.ReleaseName)
+	}
+
+	currentRelease, report, err := handleChart(ctx, dCtx, instantiatedChart, kubeconfig, isPullMode, logger)
+	setHelmFailureMessageOnHelmChartSummary(dCtx.clusterSummary, instantiatedChart, err)
+	if err != nil {
+		err = fmt.Errorf("chart=%s, releaseNamespace=%s, releaseName=%s: %w",
+			instantiatedChart.ChartName, instantiatedChart.ReleaseNamespace, instantiatedChart.ReleaseName, err)
+		if dCtx.clusterSummary.Spec.ClusterProfileSpec.ContinueOnError {
+			return &chartStepResult{accumErr: err.Error() + "\n"}, nil
+		}
+		return nil, err
+	}
+
+	valueHash, err := updateValueHashOnHelmChartSummary(ctx, instantiatedChart, dCtx, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	step := &chartStepResult{report: report}
+	if currentRelease != nil {
+		if valueHash != nil {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("release %s/%s (version %s) (value hash %x) status: %s",
+				currentRelease.ReleaseNamespace, currentRelease.ReleaseName, currentRelease.ChartVersion,
+				valueHash, currentRelease.Status))
+		} else {
+			logger.V(logs.LogInfo).Info(fmt.Sprintf("release %s/%s (version %s) status: %s",
+				currentRelease.ReleaseNamespace, currentRelease.ReleaseName, currentRelease.ChartVersion,
+				currentRelease.Status))
+		}
+		if currentRelease.Status == releasecommon.StatusDeployed.String() {
+			// Deployed chart is used for updating ClusterConfiguration. There is no ClusterConfiguration
+			// for mgmt cluster
+			step.deployedChart = &configv1beta1.Chart{
+				RepoURL:         instantiatedChart.RepositoryURL,
+				Namespace:       currentRelease.ReleaseNamespace,
+				ReleaseName:     currentRelease.ReleaseName,
+				ChartVersion:    currentRelease.ChartVersion,
+				AppVersion:      currentRelease.AppVersion,
+				LastAppliedTime: &currentRelease.Updated,
+				Icon:            currentRelease.Icon,
+			}
+		}
+	}
+
+	return step, nil
+}
+
 // walkChartsAndDeploy walks all referenced helm charts. Deploys (install or upgrade) any chart
 // this clusterSummary is registered to manage.
 func walkChartsAndDeploy(ctx context.Context, c client.Client, dCtx *deploymentContext,
@@ -1248,92 +1356,18 @@ func walkChartsAndDeploy(ctx context.Context, c client.Client, dCtx *deploymentC
 
 	for i := range dCtx.clusterSummary.Spec.ClusterProfileSpec.HelmCharts {
 		currentChart := &dCtx.clusterSummary.Spec.ClusterProfileSpec.HelmCharts[i]
-
-		instantiatedChart, err := getInstantiatedChart(ctx, dCtx, currentChart, logger)
+		step, err := deploySingleChart(ctx, c, dCtx, currentChart, kubeconfig, isPullMode, logger)
 		if err != nil {
 			return releaseReports, chartDeployed, err
 		}
-
-		l := logger.WithValues("chart", fmt.Sprintf("%s/%s", instantiatedChart.ReleaseNamespace, instantiatedChart.ReleaseName))
-		l.V(logs.LogDebug).Info(fmt.Sprintf("Deploying chart: %v", instantiatedChart))
-
-		// Eventual conflicts are already resolved before this method is called
-		// So it is safe to call CanManageChart here
-		canManage, err := canManageChart(ctx, c, dCtx.clusterSummary, instantiatedChart, logger)
-		if err != nil {
-			return releaseReports, chartDeployed, err
+		if step.report != nil {
+			releaseReports = append(releaseReports, *step.report)
 		}
-
-		if !canManage {
-			var report *configv1beta1.ReleaseReport
-			report, err = createReportForUnmanagedHelmRelease(ctx, c, dCtx.clusterSummary, instantiatedChart, logger)
-			if err != nil {
-				return releaseReports, chartDeployed, err
-			}
-
-			releaseReports = append(releaseReports, *report)
-			conflictErrorMessage += generateConflictForHelmChart(ctx, dCtx.clusterSummary, instantiatedChart)
-			// error is reported above, in updateStatusForReferencedHelmReleases.
-			if dCtx.clusterSummary.Spec.ClusterProfileSpec.ContinueOnConflict ||
-				dCtx.clusterSummary.Spec.ClusterProfileSpec.SyncMode == configv1beta1.SyncModeDryRun {
-
-				continue
-			}
-
-			// for helm chart a conflict is a non retriable error.
-			// when profile currently managing the helm chart is removed, all
-			// conflicting profiles will be automatically reconciled.
-			return releaseReports, chartDeployed,
-				&configv1beta1.NonRetriableError{Message: conflictErrorMessage}
+		if step.deployedChart != nil {
+			chartDeployed = append(chartDeployed, *step.deployedChart)
 		}
-
-		var report *configv1beta1.ReleaseReport
-		var currentRelease *releaseInfo
-		currentRelease, report, err = handleChart(ctx, dCtx, instantiatedChart,
-			kubeconfig, isPullMode, logger)
-		setHelmFailureMessageOnHelmChartSummary(dCtx.clusterSummary, instantiatedChart, err)
-		if err != nil {
-			err = fmt.Errorf("chart=%s, releaseNamespace=%s, releaseName=%s: %w",
-				instantiatedChart.ChartName, instantiatedChart.ReleaseNamespace, instantiatedChart.ReleaseName, err)
-			if dCtx.clusterSummary.Spec.ClusterProfileSpec.ContinueOnError {
-				errorMsg += err.Error() + "\n"
-				continue
-			}
-			return releaseReports, chartDeployed, err
-		}
-
-		valueHash, err := updateValueHashOnHelmChartSummary(ctx, instantiatedChart, dCtx,
-			logger)
-		if err != nil {
-			return releaseReports, chartDeployed, err
-		}
-
-		releaseReports = append(releaseReports, *report)
-
-		if currentRelease != nil {
-			if valueHash != nil {
-				logger.V(logs.LogInfo).Info(fmt.Sprintf("release %s/%s (version %s) (value hash %x) status: %s",
-					currentRelease.ReleaseNamespace, currentRelease.ReleaseName, currentRelease.ChartVersion,
-					valueHash, currentRelease.Status))
-			} else {
-				logger.V(logs.LogInfo).Info(fmt.Sprintf("release %s/%s (version %s) status: %s",
-					currentRelease.ReleaseNamespace, currentRelease.ReleaseName, currentRelease.ChartVersion,
-					currentRelease.Status))
-			}
-			if currentRelease.Status == releasecommon.StatusDeployed.String() {
-				// Deployed chart is used for updating ClusterConfiguration. There is no ClusterConfiguration
-				// for mgmt cluster
-				chartDeployed = append(chartDeployed, configv1beta1.Chart{
-					RepoURL:         instantiatedChart.RepositoryURL,
-					Namespace:       currentRelease.ReleaseNamespace,
-					ReleaseName:     currentRelease.ReleaseName,
-					ChartVersion:    currentRelease.ChartVersion,
-					AppVersion:      currentRelease.AppVersion,
-					LastAppliedTime: &currentRelease.Updated,
-					Icon:            currentRelease.Icon,
-				})
-			}
-		}
+		conflictErrorMessage += step.conflictMsg
+		errorMsg += step.accumErr
 	}
 
 	// This has to come before conflictErrorMessage as conflictErrorMessage is not retriable
@@ -1498,7 +1532,7 @@ func determineChartOwnership(ctx context.Context, c client.Client, claimingHelmM
 				return false, err
 			}
 			// Reset Status of the ClusterSummary previously managing this resource
-			err = requeueClusterSummary(ctx, libsveltosv1beta1.FeatureHelm, currentHelmManager, logger)
+			err = requeueClusterSummary(ctx, c, libsveltosv1beta1.FeatureHelm, currentHelmManager, logger)
 			if err != nil {
 				return false, err
 			}
@@ -4839,6 +4873,58 @@ func getUsernameAndPasswordFromSecret(hostname string, secret *corev1.Secret) (u
 	return username, password, nil
 }
 
+// requeueLowerTierChallengers checks all ClusterSummaries registered for the same chart in the
+// same cluster. Any challenger whose tier is lower than the current manager's tier now has higher
+// ownership priority, so it is requeued: its status is reset to Provisioning and its cached
+// deployer result is cleared, letting it re-evaluate ownership on the next reconciliation.
+//
+// This is needed when the managing ClusterSummary's tier increases: it was previously the winner
+// but may no longer be, yet CanManageChart still returns true (it is still at position 0 in the
+// in-memory chart manager). Without this call the challenger stays stuck in FailedNonRetriable
+// indefinitely because its own config hash has not changed.
+// requeueLowerTierChallengers returns true if at least one lower-tier challenger was requeued.
+func requeueLowerTierChallengers(ctx context.Context, c client.Client,
+	manager *configv1beta1.ClusterSummary, helmChart *configv1beta1.HelmChart, logger logr.Logger) (bool, error) {
+
+	chartMgr, err := chartmanager.GetChartManagerInstance(ctx, c)
+	if err != nil {
+		return false, err
+	}
+
+	registered := chartMgr.GetRegisteredClusterSummariesForChart(
+		manager.Spec.ClusterNamespace, manager.Spec.ClusterName,
+		manager.Spec.ClusterType, helmChart)
+
+	requeued := false
+	for _, csName := range registered {
+		if csName == manager.Name {
+			continue
+		}
+		challenger := &configv1beta1.ClusterSummary{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: manager.Namespace, Name: csName}, challenger); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		if deployer.HasHigherOwnershipPriority(manager.Spec.ClusterProfileSpec.Tier,
+			challenger.Spec.ClusterProfileSpec.Tier) {
+
+			logger.V(logs.LogDebug).Info(fmt.Sprintf(
+				"requeuing lower-tier challenger %s (tier %d) since current manager %s now has higher tier %d",
+				challenger.Name, challenger.Spec.ClusterProfileSpec.Tier,
+				manager.Name, manager.Spec.ClusterProfileSpec.Tier))
+			if err := requeueClusterSummary(ctx, c, libsveltosv1beta1.FeatureHelm, challenger, logger); err != nil {
+				logger.V(logs.LogInfo).Error(err, fmt.Sprintf("failed to requeue challenger %s", challenger.Name))
+				continue
+			}
+			requeued = true
+		}
+	}
+
+	return requeued, nil
+}
+
 func requeueAllOtherClusterSummaries(ctx context.Context, c client.Client,
 	namespace string, clusterSummaryNames []string, logger logr.Logger) error {
 
@@ -4854,7 +4940,7 @@ func requeueAllOtherClusterSummaries(ctx context.Context, c client.Client,
 			return err
 		}
 
-		err = requeueClusterSummary(ctx, libsveltosv1beta1.FeatureHelm, cs, logger)
+		err = requeueClusterSummary(ctx, c, libsveltosv1beta1.FeatureHelm, cs, logger)
 		if err != nil {
 			return err
 		}

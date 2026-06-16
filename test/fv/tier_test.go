@@ -206,6 +206,42 @@ var _ = Describe("Helm", Serial, func() {
 			newClusterSummary.Spec.ClusterNamespace, newClusterSummary.Spec.ClusterName, libsveltosv1beta1.FeatureHelm,
 			nil, charts)
 
+		Byf("Changing ClusterProfile %s tier to 100 (above profile1 tier 90); profile1 should reclaim kyverno", newClusterProfile.Name)
+		Expect(k8sClient.Get(context.TODO(), types.NamespacedName{Name: newClusterProfile.Name}, currentClusterProfile)).To(Succeed())
+		currentClusterProfile.Spec.Tier = 100
+		Expect(k8sClient.Update(context.TODO(), currentClusterProfile)).To(Succeed())
+
+		verifyClusterSummary(clusterops.ClusterProfileLabelName,
+			currentClusterProfile.Name, &currentClusterProfile.Spec,
+			kindWorkloadCluster.GetNamespace(), kindWorkloadCluster.GetName(), getClusterType())
+
+		Byf("Verifying ClusterProfile %s ClusterSummary reports conflict for kyverno", newClusterProfile.Name)
+		Eventually(func() bool {
+			currentClusterSummary := &configv1beta1.ClusterSummary{}
+			err = k8sClient.Get(context.TODO(),
+				types.NamespacedName{Namespace: newClusterSummary.Namespace, Name: newClusterSummary.Name}, currentClusterSummary)
+			if err != nil {
+				return false
+			}
+			if len(currentClusterSummary.Status.HelmReleaseSummaries) != 1 {
+				return false
+			}
+			return currentClusterSummary.Status.HelmReleaseSummaries[0].Status == configv1beta1.HelmChartStatusConflict
+		}, timeout, pollingInterval).Should(BeTrue())
+
+		Byf("Verifying ClusterSummary %s is Provisioned for Helm feature", clusterSummary.Name)
+		verifyFeatureStatusIsProvisioned(kindWorkloadCluster.GetNamespace(), clusterSummary.Name, libsveltosv1beta1.FeatureHelm)
+
+		charts = []configv1beta1.Chart{
+			{ReleaseName: kyvernoLatestRelease, ChartVersion: kyvernoVersion372S, Namespace: kyvernoNamespace},
+			{ReleaseName: grafanaRepoName, ChartVersion: grafanaVersion1000, Namespace: grafanaRepoName},
+			{ReleaseName: prometheusRelease, ChartVersion: prometheusVersion2739, Namespace: prometheusRelease},
+		}
+
+		verifyClusterConfiguration(configv1beta1.ClusterProfileKind, clusterProfile.Name,
+			clusterSummary.Spec.ClusterNamespace, clusterSummary.Spec.ClusterName, libsveltosv1beta1.FeatureHelm,
+			nil, charts)
+
 		deleteClusterProfile(clusterProfile)
 		deleteClusterProfile(newClusterProfile)
 
